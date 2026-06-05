@@ -98,6 +98,30 @@ ESCAPE_PATTERNS = [
 # 依赖混淆敏感词
 TYPO_DEP_PREFIXES = ["reques", "flas", "djang", "numpi", "panda", "beautifu"]
 
+# Agent 指令注入检测模式（用于 README / SKILL.md 扫描）
+AGENT_INJECTION_PATTERNS = [
+    (r"fetch\s+.*(?:url|http|https).*(?:execute|run|exec)", "指示 Agent 从 URL 获取内容并执行"),
+    (r"decode\s+.*(?:base64|hex|encoded|obfuscat).*(?:run|exec|load)", "指示 Agent 解码混淆内容后执行"),
+    (r"send\s+.*(?:file|key|token|secret|env|credential).*to\s+.*(?:http|server|remote|api)", "指示 Agent 发送敏感文件到远程服务器"),
+    (r"ignore\s+.*(?:previous|system|original|above).*instruction", "覆写/忽略系统指令，提示词注入"),
+    (r"override\s+.*(?:system|safety|guardrail|restriction)", "覆写安全护栏/限制"),
+    (r"(?:forget|disregard|ignore).*(?:rule|policy|restriction|constraint)", "指示 Agent 忽略安全规则"),
+    (r"auto\s*(?:approve|install|run|exec).*(?:without|no).*(?:ask|prompt|confirm)", "要求自动执行操作，绕过用户确认"),
+    (r"(?:you are|act as|pretend).*(?:admin|root|sudo|superuser)", "要求 Agent 以管理员身份操作"),
+    (r"download\s+.*(?:from|via).*(?:url|http|link).*(?:save|store|write)", "指示 Agent 从远程下载文件并保存"),
+    (r"upload\s+.*(?:to|via).*(?:url|http|server|remote)", "指示 Agent 上传数据到远程服务器"),
+    (r"base64\s+.*(?:decode|encode).*(?:string|data|payload)", "指示 Agent 执行 base64 编解码操作"),
+    (r"bypass\s+.*(?:safety|security|protection|guardrail)", "要求绕过安全保护机制"),
+]
+
+# 多编码组合检测（同一文件中出现多种编码类型为可疑信号）
+ENCODING_PATTERNS = {
+    "base64": r'["\'][A-Za-z0-9+/]{30,}={0,2}["\']',
+    "base85": r'["\'][A-Za-z0-9!@#$%^&*()_+\-={}\[\]|;:,.<>?]{30,}["\']',
+    "base32": r'["\'][A-Z2-7=]{30,}["\']',
+    "hex":    r'["\'][0-9A-Fa-f]{40,}["\']',
+}
+
 
 # ──────────────────────────────────────────────
 # 扫描器 1: manifest.json 分析
@@ -236,14 +260,39 @@ def scan_file_access(code: str, filepath: str, findings: list):
 # 扫描器 5: 混淆/编码检测
 # ──────────────────────────────────────────────
 def scan_obfuscation(code: str, filepath: str, findings: list):
-    """检测代码中是否包含混淆/编码内容。"""
-    # 检测 base64 编码字符串（长于 40 字符）
-    b64_patterns = re.findall(r'["\'][A-Za-z0-9+/]{40,}={0,2}["\']', code)
+    """检测代码中的混淆/编码内容，支持多种编码类型和多编码组合。"""
+    # 1. 统计每种编码的出现次数
+    encoding_hits = {}
+    for enc_name, pattern in ENCODING_PATTERNS.items():
+        matches = re.findall(pattern, code)
+        if matches:
+            encoding_hits[enc_name] = len(matches)
+
+    # 2. 检测多编码组合（同一文件中出现 2 种以上编码 → 强混淆信号）
+    if len(encoding_hits) >= 3:
+        enc_types = "、".join(encoding_hits.keys())
+        findings.append({
+            "weight": 0.7,
+            "category": "AST01",
+            "evidence": f"文件 {filepath} 同时使用了 {len(encoding_hits)} 种编码（{enc_types}），"
+                        f"疑似多层混淆隐藏恶意载荷"
+        })
+    elif len(encoding_hits) >= 2:
+        enc_types = "、".join(encoding_hits.keys())
+        findings.append({
+            "weight": 0.45,
+            "category": "AST01",
+            "evidence": f"文件 {filepath} 使用了 {len(encoding_hits)} 种编码（{enc_types}），可疑混淆"
+        })
+
+    # 3. 对 base64 做解码内容检测（解码后含恶意关键词）
+    b64_patterns = re.findall(ENCODING_PATTERNS["base64"], code)
     for b64_str in b64_patterns:
         try:
             decoded = base64.b64decode(b64_str.strip("\"'")).decode("utf-8", errors="ignore")
             is_suspicious = any(kw in decoded.lower() for kw in
-                                ["exec", "eval", "http", "token", "secret", "key", "password"])
+                                ["exec", "eval", "http", "token", "secret", "key", "password",
+                                 "requests.post", "socket", "subprocess", "base64.b64decode"])
             if is_suspicious:
                 findings.append({
                     "weight": 0.85,
@@ -254,16 +303,7 @@ def scan_obfuscation(code: str, filepath: str, findings: list):
         except Exception:
             pass
 
-    # 检测 hex 编码字符串
-    hex_patterns = re.findall(r'["\'][0-9a-fA-F]{40,}["\']', code)
-    if len(hex_patterns) > 2:
-        findings.append({
-            "weight": 0.4,
-            "category": "AST01",
-            "evidence": f"文件 {filepath} 中存在多个 hex 编码字符串，可能隐藏恶意负载"
-        })
-
-    # 检测高熵字符串（潜在的混淆载荷）
+    # 4. 检测高熵字符串（潜在的混淆载荷）
     high_entropy = []
     for match in re.finditer(r'["\'][A-Za-z0-9+/=_\-]{30,}["\']', code):
         s = match.group().strip("\"'")
@@ -319,10 +359,55 @@ def scan_escape(code: str, filepath: str, findings: list):
 
 
 # ──────────────────────────────────────────────
-# 扫描器 8: README 自然语言指令检测
+# 扫描器 8: 远程载荷执行链检测
+# ──────────────────────────────────────────────
+def scan_remote_execution_chain(code: str, filepath: str, findings: list):
+    """检测"远程拉取 → 解码/反序列化 → 执行"三级行为链。"""
+    # 检测远程数据拉取
+    has_fetch = bool(re.search(
+        r'(requests|urllib|urlopen|http\.client|httpx|aiohttp)', code
+    ))
+    has_socket_recv = bool(re.search(r'recv|recvfrom|read\s*\(', code))
+    has_network = has_fetch or has_socket_recv
+
+    # 检测解码/反序列化
+    has_decode = bool(re.search(
+        r'(b64decode|base64|base85|base32|base16|decode|unpack|loads?\s*\()', code
+    ))
+    has_deserialize = bool(re.search(
+        r'(pickle\.loads?|json\.loads?|yaml\.load|marshal\.loads?)', code
+    ))
+
+    # 检测执行
+    has_exec = bool(re.search(
+        r'(exec|eval|subprocess|os\.system|os\.popen|run\s*\()', code
+    ))
+    has_import = bool(re.search(r'__import__|importlib', code))
+
+    # 三级链：网络 + 解码 + 执行 → 强恶意
+    if has_network and has_decode and (has_exec or has_import):
+        findings.append({
+            "weight": 0.95,
+            "category": "AST01",
+            "evidence": f"文件 {filepath} 同时存在远程数据拉取、解码和代码执行调用，"
+                        f"疑似远程载荷执行链（C2 拉取 → 解码 → 执行）"
+        })
+    # 二级链：网络 + 解码（尚未执行但已具备条件）
+    elif has_network and has_decode:
+        findings.append({
+            "weight": 0.65,
+            "category": "AST01",
+            "evidence": f"文件 {filepath} 同时存在远程数据拉取和解码操作，"
+                        f"可能用于接收并还原远程载荷"
+        })
+
+
+# ──────────────────────────────────────────────
+# 扫描器 9: README 自然语言指令检测
 # ──────────────────────────────────────────────
 def scan_readme(readme_text: str, findings: list):
-    """检测 README 中的社交工程/恶意指令。"""
+    """检测 README 中的社交工程/恶意指令（含 Agent 指令注入）。"""
+    # 基础社交工程检测
     suspicious_phrases = [
         (r"disable\s+security", "要求关闭安全防护"),
         (r"turn\s+off\s+.*protect", "要求关闭保护功能"),
@@ -341,9 +426,18 @@ def scan_readme(readme_text: str, findings: list):
                 "evidence": f"README 中包含可疑指令: «{desc}»，可能存在社交工程攻击"
             })
 
+    # Agent 指令注入检测
+    for pattern, desc in AGENT_INJECTION_PATTERNS:
+        if re.search(pattern, readme_text, re.IGNORECASE):
+            findings.append({
+                "weight": 0.85,
+                "category": "AST01",
+                "evidence": f"README 中包含 Agent 指令注入: «{desc}»，可能操纵 Agent 执行恶意操作"
+            })
+
 
 # ──────────────────────────────────────────────
-# 扫描器 9: 更新验证检测
+# 扫描器 10: 更新验证检测
 # ──────────────────────────────────────────────
 def scan_update_verification(manifest: dict, findings: list):
     """检查是否缺乏更新验证机制。"""
@@ -365,6 +459,51 @@ def scan_update_verification(manifest: dict, findings: list):
             "category": "AST07",
             "evidence": "manifest 启用了自动更新但缺少完整性校验，存在更新漂移风险"
         })
+
+
+# ──────────────────────────────────────────────
+# 扫描器 11: 权限-行为一致性检测
+# ──────────────────────────────────────────────
+def scan_permission_consistency(manifest: dict, code_files: list, findings: list):
+    """对比 manifest 声明的权限与代码实际行为是否一致。"""
+    if not manifest:
+        return
+
+    declared_perms = manifest.get("permissions", {})
+    if not isinstance(declared_perms, dict):
+        return
+
+    all_code = " ".join(code for _, code in code_files)
+
+    # 检查网络权限不一致
+    if declared_perms.get("network") is False:
+        if re.search(r'(requests\.|urllib\.|socket\.connect|urlopen|httpx)', all_code):
+            findings.append({
+                "weight": 0.7,
+                "category": "AST08",
+                "evidence": "manifest 声明禁止网络权限但代码中存在网络通信调用，行为与声明不符"
+            })
+
+    # 检查文件系统权限不一致
+    fs_perm = declared_perms.get("filesystem")
+    if isinstance(fs_perm, list) and "read" in fs_perm and "write" not in fs_perm:
+        # 声明只读，但代码有写操作
+        write_patterns = r'(\.write\s*\(|open\([^)]+["\'][rwab][^"\']*["\']|os\.remove|shutil\.copy)'
+        if re.search(write_patterns, all_code):
+            findings.append({
+                "weight": 0.6,
+                "category": "AST08",
+                "evidence": "manifest 声明文件系统只读权限但代码中存在文件写入/删除操作"
+            })
+
+    # 检查 shell 权限不一致
+    if declared_perms.get("shell") is False:
+        if re.search(r'(subprocess|os\.system|os\.popen|pty\.spawn)', all_code):
+            findings.append({
+                "weight": 0.75,
+                "category": "AST08",
+                "evidence": "manifest 声明禁止 shell 执行但代码中存在 shell 调用，严重行为不一致"
+            })
 
 
 # ──────────────────────────────────────────────
@@ -408,10 +547,14 @@ def analyze_skill(skill_id: str, skill_dir: pathlib.Path) -> dict:
         scan_obfuscation(code, filepath, findings)
         scan_deserialization(code, filepath, findings)
         scan_escape(code, filepath, findings)
+        scan_remote_execution_chain(code, filepath, findings)
 
     # 只读一次 README
     scan_readme(readme_text, findings)
     scan_update_verification(manifest, findings)
+
+    # 权限-行为一致性检测（需要 manifest + 所有代码）
+    scan_permission_consistency(manifest, code_files, findings)
 
     # 5. 汇总判定
     return _aggregate_verdict(skill_id, findings)
