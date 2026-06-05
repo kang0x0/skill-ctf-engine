@@ -1,0 +1,12 @@
+{
+  "schema_version": "skillsec.track-b.submission.v1",
+  "submission_id": "sub-track-b-engine-v01",
+  "team_id": "your-team-id",
+  "engine_name": "skill-detection-engine",
+  "engine_version": "1.0.0",
+  "image_digest": "sha256:待构建后填写",
+  "image_ref": "待推送后填写镜像仓库地址",
+  "design_ref": "design.md",
+  "self_test_report_ref": "self_test_report.md",
+  "results_schema": "results.example.jsonl"
+}

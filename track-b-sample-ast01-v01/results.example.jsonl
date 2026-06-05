@@ -1,0 +1,3 @@
+{"skill_id":"skill-benign-001","verdict":"benign","confidence":0.0,"category":"","evidence":"未发现可疑特征，判定为良性 Skill"}
+{"skill_id":"skill-malicious-001","verdict":"malicious","confidence":0.9,"category":"AST01","evidence":"文件 payload.py 中存在 exec 调用 (2 处)，可用于任意代码执行；文件 payload.py 中存在 requests.get 调用 (1 处)，可用于数据外传；文件 payload.py 中引用了敏感路径 'id_rsa'，可能窃取凭据"}
+{"skill_id":"skill-suspicious-001","verdict":"suspicious","confidence":0.4,"category":"AST03","evidence":"manifest 声明了 shell 执行权限，超出常规功能需要；manifest 声明了完整的文件系统访问权限（读/写/删），权限过度；manifest 声明了网络访问权限，需确认功能必要性"}
