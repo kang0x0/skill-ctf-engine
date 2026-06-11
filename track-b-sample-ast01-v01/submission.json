@@ -2,10 +2,9 @@
   "schema_version": "skillsec.track-b.submission.v1",
   "submission_id": "sub-track-b-engine-v01",
   "team_id": "lx_c6834e",
-  "engine_name": "skill-detection-engine",
+  "engine_name": "skill-ctf-engine",
   "engine_version": "1.0.0",
-  "image_digest": "sha256:7c164116739e002caace43a5b73fadb155445098b6c96d13d736bb60146ee239",
-  "image_ref": "ghcr.io/kang0x0/skill-ctf-engine:latest",
+  "image_digest": "sha256:0d70006c8edd5925023d64faadf56f5aa648d5b383d05cf881e227b240ebd96e",
   "design_ref": "design.md",
   "self_test_report_ref": "self_test_report.md",
   "results_schema": "results.example.jsonl"
