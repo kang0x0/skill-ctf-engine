@@ -11,6 +11,7 @@ import pathlib
 import sys
 import base64
 import traceback
+from dataclasses import dataclass
 
 # ──────────────────────────────────────────────
 # 常量定义
@@ -233,6 +234,127 @@ def scan_manifest(manifest: dict, skill_id: str, findings: list):
                         "category": "AST02",
                         "evidence": f"Dependency '{dep}' resembles popular package '{prefix}', dependency confusion risk"
                     })
+
+
+# ──────────────────────────────────────────────
+# Phase B: 声明-行为一致性分析（三步对比模型）
+# ──────────────────────────────────────────────
+
+@dataclass
+class ClaimedCapability:
+    """Step 1 输出：Skill 声明的权限与功能。"""
+    permissions: dict
+    entrypoint: str | None
+    hooks: dict
+    dependencies: dict
+    update_url: str | None
+    auto_update: bool
+
+
+@dataclass
+class ActualCapability:
+    """Step 2 输出：Skill 代码中实际使用的权限与功能。"""
+    shell_used: bool
+    network_used: bool
+    filesystem_read: bool
+    filesystem_write: bool
+    code_exec_used: bool
+    decode_used: bool
+    entry_file_exists: bool
+    side_exec_files: list
+    imports_used: set
+
+
+_PAT_SHELL = re.compile(r"(?:subprocess|os\.system|os\.popen|pty\.spawn|subprocess\.(?:call|Popen|run|check_call|check_output))")
+_PAT_NETWORK = re.compile(r"(?:requests\.(?:get|post|put|delete|patch)|urllib(?:\.request|3?)|http\.client|socket\.connect|urlopen|httpx|aiohttp)")
+_PAT_WRITE = re.compile(r"(?:\.write\s*\(|open\([^)]+[\"'][rwab][^\"']*[\"']|os\.remove|shutil\.copy|pathlib\.Path\.write_text|pathlib\.Path\.write_bytes)")
+_PAT_READ = re.compile(r"(?:\.read\s*\(|open\([^)]+[\"']r[\"']|pathlib\.Path\.read_text|pathlib\.Path\.read_bytes)")
+_PAT_EXEC = re.compile(r"(?:exec\s*\(|eval\s*\(|compile\s*\()")
+_PAT_DECODE = re.compile(r"(?:base64\.b64decode|base64\.b64encode|pickle\.loads?|yaml\.load|marshal\.loads?|json\.loads?)")
+_PAT_IMPORT = re.compile(r"(?:^|\n)\s*(?:import|from)\s+(\w+(?:\.\w+)*)")
+_PAT_SIDE_DANGER = re.compile(r"(?:exec|eval|subprocess|os\.system|requests\.|socket\.)")
+
+
+def _collect_claimed(manifest):
+    """Step 1: 收集 manifest 声明的权限与功能。"""
+    perms = _normalize_permissions(manifest.get("permissions", {}))
+    entrypoint = manifest.get("entrypoint") or manifest.get("entry")
+    hooks = manifest.get("hooks", {})
+    deps = manifest.get("dependencies", {})
+    update_url = manifest.get("update_url")
+    auto_update = manifest.get("auto_update", False) or manifest.get("auto-update", False)
+    return ClaimedCapability(
+        permissions=perms, entrypoint=entrypoint,
+        hooks=hooks if isinstance(hooks, dict) else {},
+        dependencies=deps if isinstance(deps, dict) else {},
+        update_url=update_url, auto_update=auto_update,
+    )
+
+
+def _collect_actual(code_files, skill_dir, claimed):
+    """Step 2: 从代码中提取实际使用的权限与功能。"""
+    all_code = " ".join(code for _, code in code_files)
+    shell_used = bool(_PAT_SHELL.search(all_code))
+    network_used = bool(_PAT_NETWORK.search(all_code))
+    fs_read = bool(_PAT_READ.search(all_code))
+    fs_write = bool(_PAT_WRITE.search(all_code))
+    code_exec = bool(_PAT_EXEC.search(all_code))
+    decode_used = bool(_PAT_DECODE.search(all_code))
+    imports_used = set()
+    for m in _PAT_IMPORT.finditer(all_code):
+        imports_used.add(m.group(1))
+    entry_file_exists = True
+    side_exec_files = []
+    if claimed.entrypoint:
+        declared_path = skill_dir / claimed.entrypoint
+        entry_file_exists = declared_path.exists()
+        for fp, code in code_files:
+            if fp == claimed.entrypoint or fp.endswith(claimed.entrypoint):
+                continue
+            ext = pathlib.Path(fp).suffix.lower()
+            if ext in {".py", ".js", ".ts", ".sh", ".bash", ".rb", ".php", ".pl", ".ps1"}:
+                if _PAT_SIDE_DANGER.search(code):
+                    side_exec_files.append(fp)
+    return ActualCapability(
+        shell_used=shell_used, network_used=network_used,
+        filesystem_read=fs_read, filesystem_write=fs_write,
+        code_exec_used=code_exec, decode_used=decode_used,
+        entry_file_exists=entry_file_exists, side_exec_files=side_exec_files,
+        imports_used=imports_used,
+    )
+
+
+def _analyze_gap(claimed, actual, findings):
+    """Step 3: 对比差异，按权重映射到 AST 类别。"""
+    claimed_shell = claimed.permissions.get("shell")
+    claimed_network = claimed.permissions.get("network")
+    claimed_fs = claimed.permissions.get("filesystem", [])
+    if claimed_shell is not True and actual.shell_used:
+        findings.append({"weight": 0.75, "category": "AST04", "evidence": "manifest does not declare shell but code uses shell calls, permission under-declared"})
+    if claimed_network is not True and actual.network_used:
+        findings.append({"weight": 0.7, "category": "AST04", "evidence": "manifest does not declare network but code uses network calls, permission under-declared"})
+    if isinstance(claimed_fs, list) and "write" not in claimed_fs and actual.filesystem_write:
+        findings.append({"weight": 0.6, "category": "AST04", "evidence": "manifest declares read-only filesystem but code writes/deletes, permission mismatch"})
+    if claimed_shell is True and not actual.shell_used:
+        findings.append({"weight": 0.35, "category": "AST03", "evidence": "manifest declares shell but code does not invoke any, possible over-privilege"})
+    if claimed_network is True and claimed_shell is True and not actual.shell_used and not actual.network_used:
+        findings.append({"weight": 0.4, "category": "AST03", "evidence": "manifest declares both network+shell but code uses neither, excessive authorization"})
+    if claimed.entrypoint:
+        if not actual.entry_file_exists:
+            findings.append({"weight": 0.7, "category": "AST04", "evidence": f"manifest declares entrypoint '{claimed.entrypoint}' but file not found, metadata forgery risk"})
+        elif actual.side_exec_files:
+            findings.append({"weight": 0.5, "category": "AST04", "evidence": f"manifest entrypoint '{claimed.entrypoint}' but non-entry files {actual.side_exec_files} contain dangerous operations"})
+    if claimed.hooks and not actual.code_exec_used and not actual.shell_used:
+        findings.append({"weight": 0.4, "category": "AST01", "evidence": f"manifest declares install hooks ({claimed.hooks}) but code shows no execution capability, hooks may execute hidden payload"})
+
+
+def scan_claim_vs_actual(manifest, code_files, skill_dir, findings):
+    """三步对比入口：声明收集 → 实际收集 → 差异分析。"""
+    if not manifest:
+        return
+    claimed = _collect_claimed(manifest)
+    actual = _collect_actual(code_files, skill_dir, claimed)
+    _analyze_gap(claimed, actual, findings)
 
 
 # ──────────────────────────────────────────────
@@ -665,19 +787,9 @@ def analyze_skill(skill_id: str, skill_dir: pathlib.Path) -> dict:
         print(f"[WARN] scan_readme 失败: {e}", file=sys.stderr)
 
     try:
-        scan_update_verification(manifest, findings)
+        scan_claim_vs_actual(manifest, code_files, skill_dir, findings)
     except Exception as e:
-        print(f"[WARN] scan_update_verification 失败: {e}", file=sys.stderr)
-
-    try:
-        scan_permission_consistency(manifest, code_files, findings)
-    except Exception as e:
-        print(f"[WARN] scan_permission_consistency 失败: {e}", file=sys.stderr)
-
-    try:
-        scan_entrypoint_consistency(manifest, code_files, skill_dir, findings)
-    except Exception as e:
-        print(f"[WARN] scan_entrypoint_consistency failed: {e}", file=sys.stderr)
+        print(f"[WARN] scan_claim_vs_actual 失败: {e}", file=sys.stderr)
 
     # 5. 汇总判定
     return _aggregate_verdict(skill_id, findings)

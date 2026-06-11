@@ -1,0 +1,11 @@
+{
+  "schema_version": "skillsec.track-b.submission.v1",
+  "submission_id": "sub-platform-b-ast02-v01",
+  "team_id": "team-platform-sample",
+  "engine_name": "platform-engine-ast02-v01",
+  "engine_version": "0.1.0",
+  "image_digest": "sha256:d7b106c4714157647fe4305a3da2714b61c42618d7c5bc51d60f790013838557",
+  "design_ref": "design.md",
+  "self_test_report_ref": "self_test_report.md",
+  "results_schema": "results.example.jsonl"
+}
