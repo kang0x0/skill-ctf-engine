@@ -4,7 +4,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SUBMISSION_DIR="$SCRIPT_DIR/track-b-sample-ast01-v01"
+SUBMISSION_DIR="$SCRIPT_DIR/engine"
 TEST_DIR="$SCRIPT_DIR/test_output"
 SAMPLE_DIR="$SCRIPT_DIR/test_samples"
 

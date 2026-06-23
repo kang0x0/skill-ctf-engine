@@ -1,49 +1,109 @@
-赛道名称
-赛道B：蓝队检测挑战
-1) 赛道目标
-选手提交 Skill 扫描检测引擎（Docker 镜像），由主办方使用黑、白、灰三类标注样本集进行统一评测，从检出质量、性能与可解释性三个维度衡量引擎水平。
-2) 提交内容
-材料	是否必须	说明
-检测引擎（Docker 镜像）	必须	须实现标准化 I/O 接口（详见接口规范文档）
-源码	必须	引擎完整源码
-设计文档 / 方法论说明	必须	技术方案说明
-安全效果自测数据	必须	自报检出率、误报率
-性能基准数据	必须	单 Skill 检测耗时、Token 消耗量（如使用 LLM）
-分析日志 / 示例	可选	展示检测推理过程的样例
-每次提交的文件须有上述描述中的必要项，否则可能评分失败
-其中乙赛道需要提供或绑定到当前镜像版本；相同 digest 可复用，digest 变化应同步更新
-分析日志、演示视频、完整 whitepaper/writeup等可选项属于申诉或人工复核材料，不作为每次提交的硬门槛，但是top队伍我们赛后也会要求补充相关内容
-3) 引擎接口规范
-输入路径: /data/skills/{skill_id}/
-　　　　　- Skill 包（manifest.json + 代码 + 资源）
-输出路径: /output/results.jsonl
-　　　　　- 每个 skill_id 一行 JSON
-每行 JSON 格式：
+# Skill-CTF Track B — 蓝队检测引擎
+
+基于**第一性原理**的声明式静态分析引擎，用于检测 AI Agent Skill 包中的恶意行为。参加 Skill-CTF 赛道 B（蓝队检测挑战）的提交作品。
+
+---
+
+## 项目结构
+
+```
+skill-ctf/
+├── engine/                          ← 引擎提交目录
+│   ├── Dockerfile                   ← 镜像构建文件
+│   ├── engine/engine.py             ← 核心检测引擎
+│   ├── design.md                    ← 设计方案说明
+│   ├── self_test_report.md          ← 自测报告
+│   ├── results.example.jsonl        ← 输出示例
+│   └── submission.json              ← 提交元数据
+│
+├── docs/                            ← 参考资料
+│   ├── owasp-ast01-10-reference.md
+│   └── skill-package-format.md
+│
+├── test_samples/                    ← 测试样本（gitignored）
+├── test_output/                     ← 测试输出（gitignored）
+├── test_local.sh                    ← 本地测试脚本
+├── project-context.md               ← AI 项目上下文
+└── readme.md                        ← 本文件
+```
+
+## 引擎概述
+
+纯 Python 规则引擎，**零外部依赖**，通过多层静态分析检测恶意 Skill 包：
+
+- **10 项安全原则**覆盖 OWASP AST01-10
+- **声明式规则引擎** — 规则与执行逻辑分离，易于扩展
+- **纵深防御** — manifest / 代码 / README 三个独立检测层面
+- **召回率优先** — 阈值偏低（0.55/0.25），匹配 F₂ 评分体系
+
+### 核心检测能力
+
+| 安全边界 | 覆盖的 AST 类别 | 检测要点 |
+|----------|----------------|---------|
+| 代码边界 | AST01 | exec/eval/subprocess/os.system 等危险函数 |
+| 网络边界 | AST01 | 请求外发、C2 通信、反向隧道、IM webhook |
+| 供应链边界 | AST02 | 依赖混淆、包名仿冒（typosquatting） |
+| 权限边界 | AST03/04 | 声明 vs 实际行为一致性、身份伪造 |
+| 反序列化边界 | AST05 | pickle/yaml/marshal 不安全反序列化 |
+| 隔离边界 | AST06 | 容器逃逸（/proc/1/、docker socket、nsenter） |
+| 更新链边界 | AST07 | 自动更新无完整性校验 |
+| 指令边界 | AST08 | Agent 注入、社交工程指令 |
+| 加密边界 | AST09 | 弱加密、硬编码凭据、不安全随机 |
+| 平台边界 | AST10 | 跨平台攻击面、Polyglot 文件 |
+
+### 检测流水线
+
+```
+Skill 包 → manifest 扫描 → 代码多模式扫描 → README 扫描 → 聚合判定
+```
+
+## 快速开始
+
+### 构建镜像
+
+```bash
+docker build -t skill-engine:latest engine
+```
+
+### 运行检测
+
+```bash
+docker run --rm \
+  -v "/path/to/test_samples:/data/skills" \
+  -v "/path/to/test_output:/output" \
+  skill-engine:latest
+```
+
+### 查看结果
+
+```bash
+cat /path/to/test_output/results.jsonl
+```
+
+### 检查镜像大小
+
+```bash
+docker save skill-engine:latest | gzip | wc -c | python -c \
+  "import sys; print(f'{int(sys.stdin.read()) / 1024 / 1024:.2f}MB')"
+```
+
+## 输出格式
+
+每行一个 JSON 对象（JSONL 格式）：
+
+```json
 {
-  "skill_id": "字符串",
-  "verdict": "benign" | "malicious" | "suspicious",
-  "confidence": 0.0-1.0,
-  "category": "AST01-10 中的一个（强烈建议填写，影响可解释性评分）",
-  "evidence": "检测依据说明（可选）"
+  "skill_id": "skill-xxx",
+  "verdict": "benign|suspicious|malicious",
+  "confidence": 0.0~1.0,
+  "category": "AST01~AST10",
+  "evidence": "检测依据描述"
 }
-4) 资源限制
-计算资源：4 vCPU / 8GB 内存 / 30 分钟总时限
-网络：评测期间完全隔离，无外部网络访问
-镜像大小：上限 16M
-超时或内存溢出：按已完成部分计分
-5) 评分体系
-维度	权重	计算方式
-检测质量	55%	F₂ 分数（召回率加权的 F 值）
-性能	10%	检测速度 × Token 效率
-可解释性	20%	正确判定中输出精确匹配 OWASP AST 主分类的比例
-运行稳健性	15%	衡量引擎运行稳定性、异常处理能力、完成率等
-为什么用 F₂ 而非 F₁
-F₂ = 5 × (Precision × Recall) / (4 × Precision + Recall)
-F₂ 将召回率权重设为精确率的 4 倍。在安全场景中，漏报一个恶意 Skill 的危害远大于误报一个良性 Skill，因此评分体系明确偏向召回率。
-关于可解释性
-可解释性评分要求引擎输出的 category 字段与标准答案的主 OWASP AST 类别精确匹配
-仅输出 malicious 而不附带分类标签的引擎，可解释性得分为零
-试图对每个 Skill 输出全部 10 个 AST 标签"蒙混"的引擎，整体可解释性得分同样会被拉低
-混合方案（规则 + 模型 + 结构化输出）在此维度有天然优势
-总分公式
-总分 = 10 × (0.55 × F₂ + 0.10 × 性能 + 0.20 × 可解释性 + 0.15 × 运行稳健性)
+```
+
+## 技术栈
+
+- **语言**: Python 3.12
+- **依赖**: 零外部依赖（仅 Python 标准库）
+- **基础镜像**: `python:3.12.8-slim-bookworm`
+- **镜像大小**: ~11.76MB（压缩后）

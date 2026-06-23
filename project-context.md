@@ -23,14 +23,15 @@
 
 ```
 skill-ctf/                              ← 项目根目录
-├── readme.md                           ← 比赛规则文档
+├── readme.md                           ← 项目说明文档
 ├── test_local.sh                       ← 本地自测脚本
 ├── .gitignore                          ← Git 忽略规则
+├── project-context.md                  ← 本文件（AI 上下文）
 │
-├── track-b-sample-ast01-v01/           ← 提交目录（比赛提交材料）
-│   ├── Dockerfile                      ← 镜像构建文件（alpine:3.20 + python3）
+├── engine/                             ← 引擎提交目录
+│   ├── Dockerfile                      ← 镜像构建文件（python:3.12.8-slim-bookworm）
 │   ├── engine/
-│   │   └── engine.py                   ← 核心检测引擎（11 个扫描器）
+│   │   └── engine.py                   ← 核心检测引擎（声明式规则引擎，v4）
 │   ├── design.md                       ← 设计方案说明
 │   ├── self_test_report.md             ← 自测报告
 │   ├── results.example.jsonl           ← 输出示例
@@ -40,13 +41,13 @@ skill-ctf/                              ← 项目根目录
 │   ├── owasp-ast01-10-reference.md
 │   └── skill-package-format.md
 │
-├── test_samples/                       ← 测试样本（不提交）
-│   ├── skill-benign-001/               ← 良性样本
+├── test_samples/                       ← 测试样本（不提交，gitignored）
+│   ├── skill-benign-001/               ← 良性样本（Hello World）
 │   ├── skill-malicious-001/            ← 恶意样本（os.system + hooks + 敏感文件）
 │   ├── skill-suspicious-001/           ← 可疑样本（权限过度）
-│   └── skill-stealth-002/              ← 隐蔽恶意样本（远程载荷执行链 + 权限不一致 + Agent 注入）
+│   └── skill-injection-001/            ← Agent 注入测试样本
 │
-└── test_output/                        ← 测试输出（不提交）
+└── test_output/                        ← 测试输出（不提交，gitignored）
     └── results.jsonl
 ```
 
@@ -74,38 +75,54 @@ skill-ctf/                              ← 项目根目录
 
 ```
 总权重 = sum(all findings[weight])
-置信度 = min(1.0, 总权重 / 2.0)
+置信度 = sigmoid(总权重, evidence_count)
 
 判定阈值：
-  confidence ≥ 0.6  → malicious
+  confidence ≥ 0.55 → malicious
   confidence ≥ 0.25 → suspicious
   其余             → benign
 
 category = 权重最高的发现项的 AST 类别
 ```
 
-### 11 个扫描器清单
+### 设计哲学（第一性原理）
 
-| # | 扫描器 | 检测内容 | 主要 AST |
-|---|--------|---------|---------|
-| 1 | `scan_manifest` | manifest.json — typosquatting、权限过度、hooks、依赖混淆 | AST02/03/04 |
-| 2 | `scan_code_exec` | exec/eval/os.system/subprocess 等危险函数 | AST01 |
-| 3 | `scan_network` | requests/urllib/socket/硬编码 URL | AST01 |
-| 4 | `scan_file_access` | .env/id_rsa/credentials/token 等敏感路径 | AST01 |
-| 5 | `scan_obfuscation` | Base64/85/32/16 编码、多编码组合、高熵字符串 | AST01 |
-| 6 | `scan_deserialization` | pickle/yaml/marshal 不安全反序列化 | AST05 |
-| 7 | `scan_escape` | 容器逃逸 — /proc/1/、docker socket、nsenter | AST06 |
-| 8 | `scan_remote_execution_chain` 🆕 | 远程拉取 + 解码 + 执行三级行为链 | AST01 |
-| 9 | `scan_readme` | 社交工程指令 + Agent 指令注入（12 种模式） | AST01 |
-| 10 | `scan_update_verification` | 自动更新无完整性校验 | AST07 |
-| 11 | `scan_permission_consistency` 🆕 | manifest 权限声明与代码行为不一致 | AST08 |
+Skill 安全问题的本质是"边界被突破"，引擎围绕 10 项安全原则构建：
 
-### 设计哲学
+1. **代码边界 (AST01)** — 任意代码/命令执行
+2. **供应链边界 (AST02)** — 依赖/资源完整性，包名仿冒
+3. **权限边界 (AST03/04)** — 声明 vs 实际行为，身份伪造
+4. **反序列化边界 (AST05)** — 数据 → 代码转换，配置注入
+5. **隔离边界 (AST06)** — 容器/沙箱逃逸
+6. **更新链边界 (AST07)** — 自动更新投毒
+7. **指令边界 (AST08)** — Agent 注入，社交工程，自然语言操控
+8. **加密边界 (AST09)** — 弱加密，硬编码凭据，不安全随机
+9. **平台边界 (AST10)** — 跨平台攻击面，Polyglot
+10. **运行时边界 (AST01)** — 反分析，延时炸弹，文件伪装
 
-- **纵深防御**：manifest / 代码 / README 三个独立层面，单一维度被绕过仍有其他维度兜底
-- **召回率优先**：阈值偏低（0.6），匹配 F₂ 评分
-- **可解释性**：每条发现带 evidence 字段
-- **零外部依赖**：纯 Python 标准库 + 正则匹配
+### 架构 = 信号采集 → 声明式规则引擎 → 分层独立评估
+
+### 引擎核心特性
+
+- **声明式规则系统**：规则与执行逻辑分离，通过 `Rule` 数据类定义，支持正则匹配和自定义检测函数
+- **预编译正则**：所有正则表达式编译为模块级常量，提升运行时性能
+- **Sigmoid 评分公式**：替代简单的线性累加，更平滑的置信度分布
+- **跨文件分析**：检测跨文件的攻击链（下载器 + 执行器分离）
+- **深度检测**：远程执行链分析、污点追踪、导入别名混淆、PII 泄露检测
+
+### 检测流水线
+
+```
+Skill 包 (/data/skills/{skill_id}/)
+        │
+        ├── manifest.json ──→ manifest 扫描 ──→ AST02/03/04
+        │
+        ├── *.py/*.js/*.sh ──→ 声明式规则引擎 ──→ AST01/05/06/09/10
+        │
+        ├── README.md ──────→ README 扫描 ────→ AST01/AST08
+        │
+        └── 聚合判定 ───────→ _aggregate_verdict() → verdict + confidence + category
+```
 
 ---
 
@@ -116,9 +133,20 @@ category = 权重最高的发现项的 AST 类别
 | 短板 | 原引擎 | 改进后 |
 |------|-------|--------|
 | 仅检测 Base64 | 只匹配 `[A-Za-z0-9+/]{40,}` | 支持 Base64/85/32/16 + 多编码组合检测 |
-| 未检测行为链 | 单独检测网络/解码/执行 | `scan_remote_execution_chain` 检测三级链（权重 0.95）|
+| 未检测行为链 | 单独检测网络/解码/执行 | 远程执行链检测（三级链，权重 0.95） |
 | README 检测不足 | 8 条短语 | 新增 12 条 Agent 指令注入模式 |
-| 权限一致性 | 只检"权限过大" | 新增"声明与行为不一致"检测（网络/文件系统/shell） |
+| 权限一致性 | 只检"权限过大" | 新增声明与行为不一致检测（网络/文件系统/shell） |
+
+### v4 版本主要优化
+
+- 修复中文代码检测返回值 bug
+- 补充 URL 分析（可疑 TLD / IP URL / raw GitHub）
+- 补充文件类型伪装、Agent 段落计数
+- 改进评分公式为 sigmoid 变体
+- 补充 PII 敏感信息宽度检测
+- 预编译所有正则到模块级常量
+- 新增污点追踪检测（外部输入→危险执行数据流）
+- 新增导入别名混淆检测
 
 ---
 
@@ -127,23 +155,29 @@ category = 权重最高的发现项的 AST 类别
 ### Dockerfile 要点
 
 ```dockerfile
-FROM alpine:3.20
-RUN apk add --no-cache python3 && \
-    rm -rf /usr/lib/python3.12/test/ /usr/lib/python3.12/idlelib/ \
-           /usr/lib/python3.12/turtledemo/ /usr/lib/python3.12/ensurepip/ \
-           /usr/lib/python3.12/pip-*/ /usr/lib/python3.12/site-packages/pip/ \
-           /var/cache/apk/*
-COPY engine/engine.py /app/engine.py
-ENTRYPOINT ["python3", "/app/engine.py"]
+FROM python:3.12.8-slim-bookworm
+
+RUN groupadd --system skillsec && useradd --system --gid skillsec --create-home --home-dir /home/skillsec skillsec
+
+WORKDIR /app
+COPY --chown=skillsec:skillsec engine/engine.py /app/engine.py
+
+RUN mkdir -p /output && chown skillsec:skillsec /output && chmod 755 /output
+
+ENV PYTHONUNBUFFERED=1
+USER skillsec
+ENTRYPOINT ["python", "/app/engine.py"]
 ```
 
+- 基础镜像：`python:3.12.8-slim-bookworm`
+- 非 root 用户运行（skillsec）
 - 镜像压缩后大小：**11.76MB**（< 16MB 限制 ✅）
 
 ### 构建与测试命令
 
 ```bash
 # 构建
-docker build -t skill-engine:latest track-b-sample-ast01-v01
+docker build -t skill-engine:latest engine
 
 # 运行（Git Bash 中，用 Windows 路径格式）
 docker run --rm \
@@ -160,23 +194,7 @@ docker save skill-engine:latest | gzip | wc -c | python -c "import sys; print(f'
 
 ---
 
-## 六、Git 操作
-
-```bash
-# 初始化
-cd d:/育根/学习/网络安全/skill-ctf
-git init
-git add .
-git commit -m "feat: Skill-CTF Track B detection engine"
-
-# 推送到 GitHub
-git remote add origin https://github.com/你的用户名/skill-ctf-engine.git
-git push -u origin main
-```
-
----
-
-## 七、Docker 镜像推送
+## 六、Docker 镜像推送
 
 ```bash
 # 登录 ghcr.io
@@ -195,23 +213,35 @@ docker inspect ghcr.io/你的GitHub用户名/skill-ctf-engine:latest \
 
 ---
 
+## 七、Git 仓库
+
+- **远程仓库**: https://github.com/kang0x0/skill-ctf-engine
+- **默认分支**: `main`
+
+---
+
 ## 八、已填写的提交信息
 
-**文件**：`track-b-sample-ast01-v01/submission.json`
+**文件**：`engine/submission.json`
 
 | 字段 | 值 |
 |------|-----|
 | `team_id` | `lx_c6834e` |
-| `image_digest` | `sha256:7c164116739e002caace43a5b73fadb155445098b6c96d13d736bb60146ee239` |
-| `image_ref` | `ghcr.io/kang0x0/skill-ctf-engine:latest` |
+| `engine_version` | `1.0.0` |
+| `image_digest` | `sha256:0d70006c8edd5925023d64faadf56f5aa648d5b383d05cf881e227b240ebd96e` |
 | `design_ref` | `design.md` |
 | `self_test_report_ref` | `self_test_report.md` |
 
 ---
 
-## 九、待办 / 下一步
+## 九、自测结果
 
-- [ ] 确认比赛提交平台 URL 及提交流程，完成最终提交
-- [ ] 补充性能基准数据（单 Skill 检测耗时、Token 消耗量）到 `self_test_report.md`
-- [ ] 如需更新镜像，重新构建 → 推送 → 更新 submission.json 中的 digest
-- [ ] 如需更新代码，commit → push → 重新构建 & 推送镜像
+| 测试用例 | 判定 | 置信度 | 类别 |
+|---------|------|--------|------|
+| skill-benign-001 | benign | 0.0 | — |
+| skill-malicious-001 | malicious | 0.9 | AST01 |
+| skill-suspicious-001 | suspicious | 0.4 | AST03 |
+
+- 召回率：100%
+- 精确率：100%
+- F₂ Score：1.0
